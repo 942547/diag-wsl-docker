@@ -51,6 +51,27 @@ function Invoke-Diag {
     Add-Line
 }
 
+function Read-TextFileSmart {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $null }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        return $strictUtf8.GetString($bytes)
+    } catch {
+        return [System.Text.Encoding]::Default.GetString($bytes)
+    }
+}
+
 function Test-Tool {
     param([string]$Name)
     Add-Line ("=== tool: " + $Name + " ===")
@@ -111,9 +132,11 @@ Invoke-Diag "systeminfo - Hyper-V requirements (from captured sysinfo)" {
 Add-Line "## 3. OPTIONAL FEATURES (admin required)"
 if ($isAdmin) {
     Invoke-Diag "Get-WindowsOptionalFeature - WSL / VM Platform / Hyper-V" {
-        Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux,VirtualMachinePlatform,HypervisorPlatform,Microsoft-Hyper-V-All |
-            Select-Object FeatureName,State |
-            Format-Table -AutoSize | Out-String -Width 500
+        $featNames = 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform', 'HypervisorPlatform', 'Microsoft-Hyper-V-All'
+        foreach ($fn in $featNames) {
+            Get-WindowsOptionalFeature -Online -FeatureName $fn |
+                Select-Object FeatureName, State
+        }
     }
 } else {
     Add-Line "NOT ADMIN -> cannot query optional features. Re-run elevated for this section."
@@ -139,7 +162,7 @@ if ($wslCmd) {
 Add-Line
 Add-Line "=== .wslconfig ==="
 $wslcfg = Join-Path $env:USERPROFILE '.wslconfig'
-if (Test-Path $wslcfg) { Add-Line (Get-Content $wslcfg -Raw) } else { Add-Line "(no .wslconfig)" }
+if (Test-Path $wslcfg) { Add-Line (Read-TextFileSmart $wslcfg) } else { Add-Line "(no .wslconfig)" }
 Add-Line
 Add-Line "=== Registry: Lxss (default WSL config) ==="
 Add-Raw "HKCU Lxss" ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' | Select-Object DefaultVersion,DefaultDistribution) | Format-List | Out-String -Width 500)
@@ -171,7 +194,7 @@ Invoke-Diag "Docker/Dockerd processes" {
 Add-Line "=== Docker settings files ==="
 foreach ($f in @("$env:AppData\Docker\settings-store.json", "$env:AppData\Docker\settings.json", "$env:AppData\Docker\settings-data.json")) {
     Add-Line ("--- " + $f + " ---")
-    if (Test-Path $f) { Add-Line (Get-Content $f -Raw) } else { Add-Line "(not found)" }
+    if (Test-Path $f) { Add-Line (Read-TextFileSmart $f) } else { Add-Line "(not found)" }
     Add-Line
 }
 Add-Line "=== Docker log files (newest 5, filtered, last 40 lines each) ==="
@@ -182,9 +205,12 @@ if (Test-Path $logDir) {
         Sort-Object LastWriteTime -Descending | Select-Object -First 5
     foreach ($l in $logs) {
         Add-Line ("--- " + $l.FullName + "  (" + $l.LastWriteTime.ToString('yyyy-MM-dd HH:mm') + ") ---")
-        Get-Content $l.FullName -ErrorAction SilentlyContinue |
-            Where-Object { $_ -notmatch 'GET /time|S<-C |S->C |/app/settings/flat|gvisor/forwarder' } |
-            Select-Object -Last 40 | ForEach-Object { Add-Line $_ }
+        $logText = Read-TextFileSmart $l.FullName
+        if ($null -ne $logText) {
+            $logText -split "`r?`n" |
+                Where-Object { $_ -notmatch 'GET /time|S<-C |S->C |/app/settings/flat|gvisor/forwarder' } |
+                Select-Object -Last 40 | ForEach-Object { Add-Line $_ }
+        }
         Add-Line
     }
 } else {
